@@ -183,3 +183,10 @@ python3 crono.py biometric search "Weight"
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+## Install it with Muse
+
+Just give this prompt to your Muse:
+
+> "Install Cronometer CLI from https://github.com/jonathancruzate/cronometer-cli — read the README, install it, set it up for me, and show me how to use it."
+
