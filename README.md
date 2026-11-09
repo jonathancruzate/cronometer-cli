@@ -130,6 +130,16 @@ python3 crono.py diary delete --serving-id 5312075123 --date 2026-10-18 --dry-ru
 python3 crono.py diary delete --serving-id 5312075123 --date 2026-10-18
 ```
 
+### 5b. `diary export` (added 2026-10-26, CLI full-enhancement pass)
+Export diary entries across a date range, composed purely over the verified `get_diary` plumbing (no new endpoints/auth):
+```bash
+python3 crono.py diary export --from 2026-10-20 --to 2026-10-26 --format json
+python3 crono.py diary export --from 2026-10-25 --format csv
+```
+Max range 366 days. Composition verified offline against a stubbed diary (incl. Exercise/Note-type entry passthrough — `diary show` surfaces those entry types and `diary delete` already handles their IDs). Live run 2026-10-26 reached the API and failed only on the expired saved session (`auth status`: "Token Authorization failed"); re-run `auth login` to use it live.
+
+**Exercise logging / diary notes — checked, not implemented (2026-10-26):** the app binary contains `add_exercise` / `add_note` RPC names (libapp-strings), but their payload schemas are documented nowhere in this repo (unlike `add_serving`/`add_biometric`, whose shapes were reverse-engineered and live-verified), and the saved session was expired at check time, so a guessed write could neither be verified nor reliably cleaned up. Not shipped; revisit after a session refresh with a payload-capture pass.
+
 ### 6. `food search QUERY`
 Search foods (`GET /api/v3/user/{userId}/food-search/string?query=QUERY&selectedTab=ALL`) and render `id`, `name`, `source`, `measureId`, and `measureDisplayName`:
 ```bash
@@ -184,9 +194,22 @@ python3 crono.py biometric search "Weight"
 python3 -m unittest discover -s tests -v
 ```
 
+---
+
+## Session durability (added 2026-11-09)
+
+The mobile sessionKey has a fixed ~7–8 day lifetime from mint; use does not extend it. Full analysis: `DURABILITY.md`. The CLI now self-heals:
+
+- **Rotation persistence:** if a session-resume response carries a rotated `sessionKey`, `auth status` saves it (previously discarded).
+- **Heal in place:** a failed `auth status` triggers one automatic re-login from stored credentials, then re-checks (`healed: true`).
+- **Auto-relogin + retry:** any non-`auth` command failing with an auth error is retried once after an automatic re-login (auth failures happen before endpoint dispatch, so no double-posting). Kill switch: `CRONO_NO_AUTOLOGIN=1`.
+- **Keep-alive:** `keepalive.py` runs daily (cron `cronometer-cli-keepalive`, ~05:30 America/New_York): resume check, proactive re-mint when the token is older than 5 days, heal-by-relogin if already dead. State: `~/.config/cronometer-cli/keepalive-state.json` (0600, timestamps/booleans only). Exit codes: 0 healthy, 2 still dead after re-login, 3 no stored credentials yet.
+- **Credentials:** `CRONOMETER_USER`/`CRONOMETER_PASS` env first, else the 0600 file `~/.config/cronometer-cli/credentials` (`email=` / `password=` lines; template: `credentials.example`). The loader refuses files with group/other permission bits. The password goes only to the login call — never printed, logged, or stored elsewhere.
+
+---
+
 ## Install it with Muse
 
 Just give this prompt to your Muse:
 
 > "Install Cronometer CLI from https://github.com/jonathancruzate/cronometer-cli — read the README, install it, set it up for me, and show me how to use it."
-

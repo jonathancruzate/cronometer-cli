@@ -9,6 +9,7 @@ import getpass
 import json
 import os
 import re
+import stat
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -87,6 +88,98 @@ def save_session_data(
             os.chmod(session_path, 0o600)
         except OSError:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Session durability (self-healing) — see DURABILITY.md
+#
+# Observed behaviour (Oct-Nov 2026): a sessionKey minted by a full
+# email+password login lives ~7-8 days and then dies with
+# "Token Authorization failed", no matter how often it is used or resumed:
+# the 2026-10-18 mint was dead by 2026-10-26, and the 2026-10-31 19:57 EST
+# re-login was dead by 2026-11-09. The official app survives this by
+# persisting credentials and re-running loginWithEmailAndPw when token
+# resume fails (reauthenticator.dart — see AUTH-FINDINGS.md). crono.py
+# mirrors that design:
+#   1. check_status persists a rotated sessionKey whenever the login
+#      endpoint returns one (the app re-stores it via User::initialize).
+#   2. `auth status` heals in place: a failed resume triggers one automatic
+#      re-login from stored credentials, so lanes that gate on status
+#      (e.g. the food-logging skill) recover with no invocation change.
+#   3. Any other command that fails with an auth error is retried once
+#      after an automatic re-login. This is safe because auth failures are
+#      raised by the server-side auth filter before endpoint dispatch
+#      (AUTH-FINDINGS-2.md §2.3) — the failed call never executed, so a
+#      retry cannot double-post a write.
+# Credentials come from CRONOMETER_USER / CRONOMETER_PASS, else the 0600
+# file at ~/.config/cronometer-cli/credentials. The password is passed only
+# to the login call — never printed, logged, or stored anywhere else.
+# Set CRONO_NO_AUTOLOGIN=1 to disable all automatic re-login.
+# ---------------------------------------------------------------------------
+
+DEFAULT_CREDENTIALS_FILE = "~/.config/cronometer-cli/credentials"
+
+AUTH_FAILURE_MARKERS = (
+    "Token Authorization failed",
+    "Authentication Failed",
+    "session missing or expired",
+)
+
+
+def is_auth_failure(exc: BaseException) -> bool:
+    """True when an error is the server-side auth filter rejecting the token."""
+    msg = str(exc)
+    return any(marker in msg for marker in AUTH_FAILURE_MARKERS)
+
+
+def autologin_disabled() -> bool:
+    return os.environ.get("CRONO_NO_AUTOLOGIN", "").strip() not in ("", "0", "false", "False")
+
+
+def resolve_credentials_path() -> Path:
+    path_str = os.environ.get("CRONOMETER_CREDENTIALS_FILE") or DEFAULT_CREDENTIALS_FILE
+    return Path(path_str).expanduser()
+
+
+def load_credentials_file(path: Optional[Path] = None) -> Optional[tuple]:
+    """Read (email, password) from the 0600 credentials file, or None.
+
+    Format: one KEY=VALUE per line; keys `email` (or `user`) and `password`
+    (or `pass`); blank lines and `#` comments are ignored. Returns None when
+    the file is missing or either value is absent/empty. Refuses files with
+    group/other permission bits set — a credential file must be 0600.
+    """
+    cred_path = path or resolve_credentials_path()
+    if not cred_path.exists():
+        return None
+    mode = stat.S_IMODE(os.stat(cred_path).st_mode)
+    if mode & 0o077:
+        raise CronoError(
+            f"Credentials file {cred_path} has mode {oct(mode)}; "
+            f"refusing to read it — run: chmod 600 {cred_path}"
+        )
+    values: Dict[str, str] = {}
+    with cred_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, _, value = stripped.partition("=")
+            values[key.strip().lower()] = value.strip()
+    email = values.get("email") or values.get("user")
+    password = values.get("password") or values.get("pass")
+    if not email or not password:
+        return None
+    return email, password
+
+
+def stored_credentials() -> Optional[tuple]:
+    """Credentials for automatic re-login: env vars first, then the file."""
+    user = os.environ.get("CRONOMETER_USER")
+    password = os.environ.get("CRONOMETER_PASS")
+    if user and password:
+        return user, password
+    return load_credentials_file()
 
 
 def extract_anticsrf(html_text: str) -> str:
@@ -421,6 +514,7 @@ class CronoClient:
             self.session_path,
             user_id=self.user_id,
             session_key=self.session_key,
+            meta={"lastLoginAt": datetime.datetime.now(datetime.timezone.utc).isoformat()},
         )
         return {
             "success": True,
@@ -519,11 +613,36 @@ class CronoClient:
             resp = self.post_v2("login", body=payload, include_auth=False)
             logged_in = isinstance(resp, dict) and (resp.get("id") is not None or resp.get("sessionKey") is not None)
             uid = int(resp["id"]) if isinstance(resp, dict) and resp.get("id") is not None else self.user_id
+            rotated = False
+            if logged_in and isinstance(resp, dict):
+                # The login endpoint is the single mint point, and the app
+                # re-stores whatever it returns on BOTH login paths
+                # (User::initialize — AUTH-FINDINGS-2.md §1). If the server
+                # rotated the key on this resume, persist it; discarding it
+                # (the old behaviour) strands the CLI on a dying token.
+                new_key = resp.get("sessionKey")
+                key_changed = isinstance(new_key, str) and bool(new_key) and new_key != self.session_key
+                if key_changed or uid != self.user_id:
+                    self.user_id = uid
+                    if key_changed:
+                        self.session_key = new_key
+                    save_session_data(
+                        self.session_path,
+                        user_id=self.user_id,
+                        session_key=self.session_key,
+                        meta=(
+                            {"lastLoginAt": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+                            if key_changed
+                            else None
+                        ),
+                    )
+                    rotated = key_changed
             return {
                 "loggedIn": logged_in,
                 "userId": uid,
                 "serviceLevel": resp.get("serviceLevel") if isinstance(resp, dict) else None,
                 "sessionFile": str(self.session_path),
+                "rotated": rotated,
             }
         except (CronoError, requests.RequestException) as exc:
             return {
@@ -574,6 +693,25 @@ class CronoClient:
                 except (CronoError, requests.RequestException):
                     foods_map = {}
         return parse_diary_response(day, raw_diary, foods_map=foods_map)
+
+    def export_diary(self, start_str: str, end_str: str) -> Dict[str, Any]:
+        """Export diary entries across a date range (added 2026-10-26, CLI
+        full-enhancement pass). Pure composition over the verified
+        get_diary plumbing — no new endpoints or auth."""
+        start = datetime.date.fromisoformat(validate_date(start_str))
+        end = datetime.date.fromisoformat(validate_date(end_str))
+        if end < start:
+            raise CronoError("export range: --to must be on or after --from")
+        if (end - start).days > 366:
+            raise CronoError("export range too large (max 366 days)")
+        days = []
+        cur = start
+        while cur <= end:
+            day = self.get_diary(cur.isoformat())
+            days.append({"date": day["date"], "totals": day.get("totals", {}),
+                         "entries": day.get("entries", [])})
+            cur += datetime.timedelta(days=1)
+        return {"from": start.isoformat(), "to": end.isoformat(), "days": days}
 
     def add_diary_entry(
         self,
@@ -1135,6 +1273,12 @@ def format_auth_status(data: Dict[str, Any]) -> None:
     if data.get("serviceLevel"):
         print(f"service_level: {data.get('serviceLevel')}")
     print(f"session_file: {data.get('sessionFile')}")
+    if data.get("rotated"):
+        print("rotated: true (server issued a fresh sessionKey; saved)")
+    if data.get("healed"):
+        print("healed: true (automatic re-login restored the session)")
+    if data.get("healError"):
+        print(f"heal_error: {data.get('healError')}")
     if data.get("error"):
         print(f"error: {data.get('error')}")
 
@@ -1287,6 +1431,11 @@ def build_parser() -> argparse.ArgumentParser:
     diary_del.add_argument("--date", required=True, help="Required date YYYY-MM-DD of the diary entry")
     diary_del.add_argument("--dry-run", action="store_true", help="Print delete payload without sending request")
 
+    diary_export = diary_sub.add_parser("export", help="Export diary entries for a date range (JSON or CSV) via get_diary")
+    diary_export.add_argument("--from", dest="from_date", default=None, help="Start date YYYY-MM-DD (default: today)")
+    diary_export.add_argument("--to", dest="to_date", default=None, help="End date YYYY-MM-DD (default: --from)")
+    diary_export.add_argument("--format", choices=["json", "csv"], default="json", help="Output format (default: json)")
+
     # 6 & 7: food
     food_parser = subparsers.add_parser("food", help="Search foods and list custom foods")
     food_sub = food_parser.add_subparsers(dest="command", required=True)
@@ -1332,7 +1481,31 @@ def _prompt_credentials(args_totp: Optional[str]) -> tuple[str, str, Optional[st
     return user, password, totp
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def _heal_status(client: CronoClient) -> Dict[str, Any]:
+    """`auth status` with in-place self-heal (mirrors the app reauthenticator).
+
+    A failed resume triggers one automatic re-login from stored credentials,
+    then a fresh resume check. The result reports `healed` on success or
+    `healError` when the re-login itself failed. With no stored credentials
+    (or CRONO_NO_AUTOLOGIN set) the plain failed status is returned as-is.
+    """
+    res = client.check_status()
+    if res.get("loggedIn") or autologin_disabled():
+        return res
+    creds = stored_credentials()
+    if not creds:
+        return res
+    try:
+        client.login(email=creds[0], password=creds[1])
+    except CronoError as exc:
+        res["healError"] = str(exc)
+        return res
+    healed = client.check_status()
+    healed["healed"] = bool(healed.get("loggedIn"))
+    return healed
+
+
+def _main_once(argv: Optional[List[str]] = None, _raise_auth: bool = False) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -1353,7 +1526,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             print_output(res, args.json, format_auth_login)
 
         elif args.group == "auth" and args.command == "status":
-            res = client.check_status()
+            res = _heal_status(client)
             print_output(res, args.json, format_auth_status)
 
         elif args.group == "diary" and args.command == "show":
@@ -1373,6 +1546,27 @@ def main(argv: Optional[List[str]] = None) -> int:
                 dry_run=args.dry_run,
             )
             print_output(res, args.json, format_write_result)
+
+        elif args.group == "diary" and args.command == "export":
+            start = args.from_date or datetime.date.today().isoformat()
+            end = args.to_date or start
+            res = client.export_diary(start, end)
+            if args.format == "csv" and not args.json:
+                import csv as _csv
+                import io as _io
+                buf = _io.StringIO()
+                w = _csv.writer(buf)
+                w.writerow(["date", "time", "type", "id", "name", "foodId",
+                            "metricId", "grams", "amount", "measure"])
+                for day in res["days"]:
+                    for e in day["entries"]:
+                        w.writerow([day["date"], e.get("time"), e.get("type"),
+                                    e.get("id"), e.get("name"), e.get("foodId"),
+                                    e.get("metricId"), e.get("grams"),
+                                    e.get("amount"), e.get("measure")])
+                print(buf.getvalue(), end="")
+            else:
+                print_output(res, True)
 
         elif args.group == "diary" and args.command == "delete":
             res = client.delete_diary_entry(
@@ -1414,13 +1608,54 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 2
 
     except CronoError as exc:
-        if args.json:
-            print(json.dumps({"error": str(exc)}, indent=2, sort_keys=True), file=sys.stderr)
-        else:
-            print(f"Error: {exc}", file=sys.stderr)
+        if _raise_auth and is_auth_failure(exc):
+            raise
+        _print_crono_error(args.json, exc)
         return 1
 
     return 0
+
+
+def _print_crono_error(as_json: bool, exc: CronoError) -> None:
+    if as_json:
+        print(json.dumps({"error": str(exc)}, indent=2, sort_keys=True), file=sys.stderr)
+    else:
+        print(f"Error: {exc}", file=sys.stderr)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return _main_once(argv, _raise_auth=True)
+    except CronoError as exc:
+        # Self-heal: one automatic re-login + one retry for non-auth commands
+        # that died on an expired token. Safe because auth failures are
+        # raised by the server-side auth filter before endpoint dispatch
+        # (AUTH-FINDINGS-2.md §2.3) — the failed call never executed, so the
+        # retry cannot double-post a write. See DURABILITY.md.
+        if args.group == "auth" or not is_auth_failure(exc) or autologin_disabled():
+            _print_crono_error(args.json, exc)
+            return 1
+        try:
+            creds = stored_credentials()
+        except CronoError as cred_exc:
+            _print_crono_error(args.json, cred_exc)
+            return 1
+        if not creds:
+            _print_crono_error(args.json, exc)
+            return 1
+        try:
+            fresh = CronoClient(base_url=args.base_url, session_file=args.session_file)
+            fresh.login(email=creds[0], password=creds[1])
+        except CronoError as login_exc:
+            _print_crono_error(args.json, login_exc)
+            return 1
+        print(
+            "Session had expired; automatic re-login succeeded — retrying the command.",
+            file=sys.stderr,
+        )
+        return _main_once(argv)
 
 
 if __name__ == "__main__":

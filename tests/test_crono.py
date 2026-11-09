@@ -616,5 +616,193 @@ class TestCronoFoodTargetsBiometricsErrors(unittest.TestCase):
             self.assertLessEqual(len(msg), len("Non-JSON response (HTTP 200): ") + 200)
 
 
+class TestCronoDurability(unittest.TestCase):
+    """Self-healing: rotation persistence, credentials file, auto-relogin."""
+
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.session_file = Path(self.tmpdir.name) / "session.json"
+        self.creds_file = Path(self.tmpdir.name) / "credentials"
+        crono.save_session_data(
+            self.session_file,
+            user_id=111222,
+            session_key="dead_key_for_durability_tests_0",
+        )
+        self._env_keys = (
+            "CRONOMETER_USER",
+            "CRONOMETER_PASS",
+            "CRONOMETER_CREDENTIALS_FILE",
+            "CRONO_NO_AUTOLOGIN",
+        )
+        self._saved_env = {k: os.environ.get(k) for k in self._env_keys}
+        os.environ.pop("CRONOMETER_USER", None)
+        os.environ.pop("CRONOMETER_PASS", None)
+        os.environ.pop("CRONO_NO_AUTOLOGIN", None)
+        os.environ["CRONOMETER_CREDENTIALS_FILE"] = str(self.creds_file)
+
+    def tearDown(self) -> None:
+        for key, value in self._saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self.tmpdir.cleanup()
+
+    def _write_creds(self, mode: int = 0o600, body: str = "email=u@example.com\npassword=file_pw\n") -> None:
+        self.creds_file.write_text(body, encoding="utf-8")
+        os.chmod(self.creds_file, mode)
+
+    def test_is_auth_failure_markers(self) -> None:
+        self.assertTrue(crono.is_auth_failure(crono.CronoError("API error: Token Authorization failed")))
+        self.assertTrue(crono.is_auth_failure(crono.CronoError("API error: Authentication Failed")))
+        self.assertTrue(
+            crono.is_auth_failure(crono.CronoError("HTTP 401: session missing or expired, run auth login"))
+        )
+        self.assertFalse(crono.is_auth_failure(crono.CronoError("API error: Invalid request")))
+        self.assertFalse(crono.is_auth_failure(crono.CronoError("API error: TOTP_CODE_REQUIRED")))
+
+    def test_check_status_persists_rotated_key(self) -> None:
+        resume_resp = make_mock_response(
+            status_code=200,
+            json_data={"id": 111222, "sessionKey": "rotated_key_from_resume_00000000", "serviceLevel": "GOLD"},
+        )
+        with mock.patch.object(requests.Session, "request", return_value=resume_resp):
+            client = crono.CronoClient(session_file=str(self.session_file))
+            status = client.check_status()
+
+        self.assertTrue(status["loggedIn"])
+        self.assertTrue(status["rotated"])
+        self.assertEqual(client.session_key, "rotated_key_from_resume_00000000")
+        saved = crono.load_session_data(self.session_file)
+        self.assertEqual(saved["sessionKey"], "rotated_key_from_resume_00000000")
+        self.assertIn("lastLoginAt", saved)
+
+    def test_check_status_no_rotation_same_key(self) -> None:
+        resume_resp = make_mock_response(
+            status_code=200,
+            json_data={"id": 111222, "sessionKey": "dead_key_for_durability_tests_0", "serviceLevel": "GOLD"},
+        )
+        with mock.patch.object(requests.Session, "request", return_value=resume_resp):
+            client = crono.CronoClient(session_file=str(self.session_file))
+            status = client.check_status()
+
+        self.assertTrue(status["loggedIn"])
+        self.assertFalse(status["rotated"])
+        saved = crono.load_session_data(self.session_file)
+        self.assertEqual(saved["sessionKey"], "dead_key_for_durability_tests_0")
+
+    def test_credentials_file_parsing_and_perms(self) -> None:
+        self.assertIsNone(crono.load_credentials_file())  # missing file
+        self._write_creds(body="# comment\n\nemail=u@example.com\npassword=file_pw\n")
+        self.assertEqual(crono.load_credentials_file(), ("u@example.com", "file_pw"))
+        self._write_creds(body="email=u@example.com\npassword=\n")
+        self.assertIsNone(crono.load_credentials_file())  # empty password
+        self._write_creds(mode=0o644)
+        with self.assertRaises(crono.CronoError):
+            crono.load_credentials_file()
+
+    def test_stored_credentials_env_precedence(self) -> None:
+        self._write_creds()
+        self.assertEqual(crono.stored_credentials(), ("u@example.com", "file_pw"))
+        os.environ["CRONOMETER_USER"] = "env@example.com"
+        os.environ["CRONOMETER_PASS"] = "env_pw"
+        self.assertEqual(crono.stored_credentials(), ("env@example.com", "env_pw"))
+
+    def test_main_retries_once_after_autologin(self) -> None:
+        os.environ["CRONOMETER_USER"] = "u@example.com"
+        os.environ["CRONOMETER_PASS"] = "env_pw"
+        calls = {"diary": 0, "login": 0}
+
+        def fake_request(**kwargs: object) -> mock.MagicMock:
+            url = str(kwargs.get("url", ""))
+            if url.endswith("/login"):
+                calls["login"] += 1
+                return make_mock_response(
+                    200,
+                    json_data={"id": 111222, "sessionKey": "fresh_key_after_relogin_000000", "serviceLevel": "GOLD"},
+                )
+            if url.endswith("/get_diary"):
+                calls["diary"] += 1
+                if calls["diary"] == 1:
+                    return make_mock_response(200, json_data={"error": "Token Authorization failed"})
+                return make_mock_response(
+                    200,
+                    json_data={
+                        "diary": [],
+                        "summary": {"consumed": {"kcal": 0, "protein_g": 0, "carbs_g": 0, "fat_g": 0}},
+                        "info": {},
+                        "messages": [],
+                    },
+                )
+            if url.endswith("/get_foods"):
+                return make_mock_response(200, json_data={"foods": []})
+            raise AssertionError(f"unexpected URL {url}")
+
+        with mock.patch.object(requests.Session, "request", side_effect=fake_request):
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                rc = crono.main(
+                    ["--session-file", str(self.session_file), "diary", "show", "--date", "2026-10-16"]
+                )
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls["diary"], 2)
+        self.assertEqual(calls["login"], 1)
+        saved = crono.load_session_data(self.session_file)
+        self.assertEqual(saved["sessionKey"], "fresh_key_after_relogin_000000")
+
+    def test_main_without_credentials_does_not_retry(self) -> None:
+        calls = {"diary": 0}
+
+        def fake_request(**kwargs: object) -> mock.MagicMock:
+            url = str(kwargs.get("url", ""))
+            if url.endswith("/get_diary"):
+                calls["diary"] += 1
+                return make_mock_response(200, json_data={"error": "Token Authorization failed"})
+            raise AssertionError(f"unexpected URL {url}")
+
+        with mock.patch.object(requests.Session, "request", side_effect=fake_request):
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                rc = crono.main(
+                    ["--session-file", str(self.session_file), "diary", "show", "--date", "2026-10-16"]
+                )
+
+        self.assertEqual(rc, 1)
+        self.assertEqual(calls["diary"], 1)
+
+    def test_auth_status_heals_via_main(self) -> None:
+        os.environ["CRONOMETER_USER"] = "u@example.com"
+        os.environ["CRONOMETER_PASS"] = "env_pw"
+        calls = {"resume": 0}
+
+        def fake_request(**kwargs: object) -> mock.MagicMock:
+            url = str(kwargs.get("url", ""))
+            body = kwargs.get("json") or {}
+            if url.endswith("/login") and "email" in body:
+                return make_mock_response(
+                    200,
+                    json_data={"id": 111222, "sessionKey": "healed_key_from_status_00000000", "serviceLevel": "GOLD"},
+                )
+            if url.endswith("/login"):
+                calls["resume"] += 1
+                if calls["resume"] == 1:
+                    return make_mock_response(200, json_data={"error": "Token Authorization failed"})
+                return make_mock_response(
+                    200,
+                    json_data={"id": 111222, "sessionKey": "healed_key_from_status_00000000", "serviceLevel": "GOLD"},
+                )
+            raise AssertionError(f"unexpected URL {url}")
+
+        out = io.StringIO()
+        with mock.patch.object(requests.Session, "request", side_effect=fake_request):
+            with redirect_stdout(out), redirect_stderr(io.StringIO()):
+                rc = crono.main(["--session-file", str(self.session_file), "auth", "status"])
+
+        self.assertEqual(rc, 0)
+        self.assertIn("logged_in: true", out.getvalue())
+        self.assertIn("healed: true", out.getvalue())
+        saved = crono.load_session_data(self.session_file)
+        self.assertEqual(saved["sessionKey"], "healed_key_from_status_00000000")
+
+
 if __name__ == "__main__":
     unittest.main()
