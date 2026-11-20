@@ -311,6 +311,10 @@ class TestCronoDiaryAndPayloads(unittest.TestCase):
                 "time": "08:30:00",
                 "type": "Serving",
                 "userId": 111222,
+                # 08:30 defaults to the 8:00 AM diary group (2), seq 1:
+                # order = (2 << 16) + 1. An add with no packed order lands
+                # at order 0 under "Previous Day" (2026-11-19 bug).
+                "order": 131073,
             },
         )
         self.assertEqual(payload["config"], {"call_version": 2})
@@ -368,7 +372,9 @@ class TestCronoDiaryAndPayloads(unittest.TestCase):
                 time_str="08:30",
                 dry_run=False,
             )
-            mock_req.assert_called_once()
+            # Two calls: get_diary first (to refine the group sequence),
+            # then add_serving with the exact payload.
+            self.assertEqual(mock_req.call_count, 2)
             self.assertEqual(mock_req.call_args.kwargs["url"], "https://mobile.cronometer.com/api/v2/add_serving")
             self.assertEqual(mock_req.call_args.kwargs["json"], payload)
             self.assertEqual(sent["servingId"], 999888777)
@@ -545,7 +551,8 @@ class TestCronoFoodTargetsBiometricsErrors(unittest.TestCase):
         ) as mock_req:
             client = crono.CronoClient(session_file=str(self.session_file))
             res = client.log_biometric(metric_id=1, value=75.4, date_str="2026-10-15", time_str="06:50")
-            mock_req.assert_called_once()
+            # Two calls: get_diary first (group sequence), then add_biometric.
+            self.assertEqual(mock_req.call_count, 2)
             self.assertEqual(mock_req.call_args.kwargs["url"], "https://mobile.cronometer.com/api/v2/add_biometric")
             self.assertEqual(mock_req.call_args.kwargs["json"], payload)
             self.assertEqual(res["entryId"], 3210)

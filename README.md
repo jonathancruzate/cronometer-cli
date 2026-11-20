@@ -123,6 +123,8 @@ python3 crono.py diary add \
   --time 08:30
 ```
 
+**Diary groups (fixed 2026-11-19):** this account's groups in display order are Previous Day (0), 12:00 AM (1), 8:00 AM (2), 12:00 PM (3), 4:00 PM (4), Next Day (5), Biometrics & Exercise (6), Supplements (7). Cronometer encodes an entry's group in its `order` field as `(group << 16) + sequence_within_group` (sequence starts at 1); `get_diary` returns no groupId, and the server stores `order` verbatim. An add with no `order` therefore lands at order 0, displayed under **Previous Day**, regardless of its time. That was the pre-fix behavior, repaired in place via `POST /api/v2/edit_serving` (see `CronoClient.edit_serving_order`). Current behavior: a plain `diary add` reads the day's diary, picks the time-of-day group for `--time` (00:00-07:59 -> 1, 08:00-11:59 -> 2, 12:00-15:59 -> 3, 16:00-23:59 -> 4), and uses the next free sequence in that group. `--group-id N` overrides the group (same sequence logic); meds and supplements must pass `--group-id 7`. `--order` passes a raw packed value through untouched. `biometric log` always uses group 6. Groups 0 and 5 are explicit adjacent-day allocation only, never a default.
+
 ### 5. `diary delete`
 Delete a diary entry by `--serving-id` and `--date` (`DELETE /api/v3/user/{userId}/diary-entries`). Fetches that day's diary first to locate the exact entry object, sends the V3 `DELETE` (204 No Content), and re-fetches the diary to verify removal:
 ```bash

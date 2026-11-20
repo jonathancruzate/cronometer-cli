@@ -229,6 +229,46 @@ def build_auth_envelope(user_id: Optional[int] = None, session_key: Optional[str
     }
 
 
+# Diary groups on this account, in display order (verified 2026-10-02 and
+# 2026-11-08). Cronometer encodes the group in the entry's "order" field:
+# order = (group_index << 16) + sequence_within_group (sequence starts at 1).
+# There is no groupId in get_diary responses, and the server stores whatever
+# "order" it is sent verbatim, so an add with no order lands at order 0,
+# which displays under "Previous Day". Every add must therefore carry a
+# packed order for its proper group (bug found and repaired 2026-11-19:
+# 64 CLI entries sat at order 0 under Previous Day).
+DIARY_GROUPS = {
+    0: "Previous Day",
+    1: "12:00 AM",
+    2: "8:00 AM",
+    3: "12:00 PM",
+    4: "4:00 PM",
+    5: "Next Day",
+    6: "Biometrics & Exercise",
+    7: "Supplements",
+}
+
+
+def diary_group_for_time(time_str: str) -> int:
+    """Time-of-day food group: 00:00-07:59 -> 12:00 AM (1), 08:00-11:59 ->
+    8:00 AM (2), 12:00-15:59 -> 12:00 PM (3), 16:00-23:59 -> 4:00 PM (4).
+    Previous Day (0) and Next Day (5) are explicit adjacent-day allocation
+    only, never a time default. Meds/supplements use 7 and biometrics /
+    exercise use 6 regardless of time; pass those as group_id."""
+    hour = int(str(time_str)[:2])
+    if hour < 8:
+        return 1
+    if hour < 12:
+        return 2
+    if hour < 16:
+        return 3
+    return 4
+
+
+def pack_group_order(group_id: int, seq: int) -> int:
+    return (int(group_id) << 16) + int(seq)
+
+
 def build_serving_object(
     food_id: int,
     measure_id: int,
@@ -253,9 +293,13 @@ def build_serving_object(
     if order is not None:
         serving["order"] = int(order)
     elif group_id is not None:
-        serving["order"] = int(group_id)
-    if group_id is not None:
-        serving["groupId"] = int(group_id)
+        serving["order"] = pack_group_order(int(group_id), 1)
+    else:
+        # Default: the time-of-day diary group for the entry time, seq 1.
+        # The client refines the sequence from the day's live diary before
+        # sending; a bare payload built offline gets the group right, which
+        # is the part the diary display depends on.
+        serving["order"] = pack_group_order(diary_group_for_time(tm), 1)
     return serving
 
 
@@ -308,7 +352,9 @@ def build_biometric_object(
         "time": tm,
         "type": "Biometric",
         "userId": int(user_id) if user_id is not None else None,
-        "order": int(order) if order is not None else 65537,
+        # Biometrics live in the "Biometrics & Exercise" group (6), not the
+        # 12:00 AM group (the old 65537 default was group 1).
+        "order": int(order) if order is not None else pack_group_order(6, 1),
     }
     return bio
 
@@ -746,6 +792,11 @@ class CronoClient:
                 "endpoint": self._endpoint("add_serving", v3=False),
                 "payload": dry_payload,
             }
+        if order is None:
+            # Refine the packed order's sequence from the day's live diary
+            # so same-group entries keep a unique, increasing sequence.
+            target_group = group_id if group_id is not None else diary_group_for_time(time_str)
+            payload["serving"]["order"] = self._next_group_order(date_str, target_group)
         resp = self.post_v2("add_serving", body=payload, include_auth=False)
         serving_id = _extract_serving_id(resp)
         return {
@@ -755,6 +806,65 @@ class CronoClient:
             "payload": payload["serving"],
             "response": resp,
         }
+
+    def _next_group_order(self, date_str: str, group_id: int) -> int:
+        """Next packed order for a diary group on a day: (group << 16) +
+        (max existing sequence in that group + 1). Falls back to seq 1 if
+        the day's diary cannot be read; the group stays correct either way."""
+        seq = 1
+        try:
+            raw = self.post_v2("get_diary", body={"day": validate_date(date_str)})
+            entries = raw.get("diary") if isinstance(raw, dict) else None
+            if isinstance(entries, list):
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    existing = entry.get("order") or 0
+                    if (existing >> 16) == int(group_id):
+                        seq = max(seq, (existing & 0xFFFF) + 1)
+        except Exception:
+            pass
+        return pack_group_order(int(group_id), seq)
+
+    def edit_serving_order(
+        self,
+        serving_id: int,
+        date_str: str,
+        new_order: int,
+    ) -> Dict[str, Any]:
+        """Move an existing serving to a different diary group in place via
+        the V2 edit_serving endpoint, preserving servingId, food, amount,
+        date and time. Used to repair mis-grouped entries (2026-11-19)."""
+        day = validate_date(date_str)
+        raw = self.post_v2("get_diary", body={"day": day})
+        entries = raw.get("diary") if isinstance(raw, dict) else None
+        matched = None
+        if isinstance(entries, list):
+            for entry in entries:
+                if isinstance(entry, dict) and entry.get("servingId") == int(serving_id):
+                    matched = entry
+                    break
+        if matched is None:
+            raise CronoError(f"Serving ID {serving_id} not found in diary for {day}")
+        serving = {
+            "servingId": int(serving_id),
+            "foodId": matched.get("foodId"),
+            "measureId": matched.get("measureId"),
+            "grams": matched.get("grams"),
+            "day": day,
+            "time": matched.get("time"),
+            "type": "Serving",
+            "userId": self.user_id,
+            "order": int(new_order),
+        }
+        payload = {
+            "serving": serving,
+            "auth": self._auth_envelope(),
+            "lastSeen": 0,
+            "config": {"call_version": 2},
+        }
+        resp = self.post_v2("edit_serving", body=payload, include_auth=False)
+        return {"servingId": serving_id, "date": day, "order": int(new_order), "response": resp}
 
     def delete_diary_entry(
         self,
@@ -861,6 +971,7 @@ class CronoClient:
                 "endpoint": self._endpoint("add_biometric", v3=False),
                 "payload": dry_payload,
             }
+        payload["biometric"]["order"] = self._next_group_order(date_str, 6)
         resp = self.post_v2("add_biometric", body=payload, include_auth=False)
         entry_id = _extract_serving_id(resp)
         return {
